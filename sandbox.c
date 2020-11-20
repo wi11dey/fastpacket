@@ -26,7 +26,7 @@ int sandbox(void* argv) {
   setuid(uid);
 
   // Begin tracing
-  ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+  //ptrace(PTRACE_TRACEME, 0, NULL, NULL);
 
   // Execute guest.pyc using python3
   execlp("python3", "python3", "guest.pyc", NULL);
@@ -59,10 +59,10 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS; // Return success even if the child does not, because at least the sandboxer has done its job
   }
   // Trace any additional processes the child spawns, and also take it down with us if we die
-  if (ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK  | PTRACE_O_TRACEVFORK | PTRACE_0_EXITKILL) == -1) {
-    perror("Failed to set ptrace options");
-    return EXIT_FAILURE;
-  }
+  //if (ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK  | PTRACE_O_TRACEVFORK | PTRACE_0_EXITKILL) == -1) {
+  //  perror("Failed to set ptrace options");
+  //  return EXIT_FAILURE;
+  //}
 
   
   return EXIT_SUCCESS; // Return success even if the child does not, because at least the sandboxer has done its job
