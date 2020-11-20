@@ -1,0 +1,14 @@
+#!/bin/bash
+
+protected_branch='main'
+current_branch=$(git symbolic-ref HEAD | sed -e 's,.*/\(.*\),\1,')
+
+if [ $protected_branch = $current_branch ]
+then
+    echo "Pushing to main is not allowed!"
+    echo "Create a branch with \`git checkout -b <branchname>\`."
+    echo "Push with \`git push origin <branchname>\`."
+    exit 1 # push will not execute
+else
+    exit 0 # push will execute
+fi
