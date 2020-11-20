@@ -37,6 +37,7 @@ int sandbox(void* argv) {
 }
 
 pid_t wait_for_syscall(pid_t awaited_pid, size_t num_kids, pid_t* kids) {
+  printf("wait_for_syscall %d\n", awaited_pid);
   int status;
   // Wait for any child to change state
   pid_t pid = waitpid(awaited_pid, &status, 0);
