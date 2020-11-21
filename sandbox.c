@@ -25,6 +25,7 @@ typedef struct {
     SYSCALL_EXIT = !SYSCALL_ENTER,
     SYSCALL_BLOCKED
   } next;
+  struct user_regs_struct registers;
 } Child;
 
 int sandbox(void* argv) {
@@ -58,40 +59,6 @@ int sandbox(void* argv) {
   }
 
   return EXIT_SUCCESS;
-}
-
-bool check_syscall(pid_t pid) {
-  // Part 4: connect() restriction
-  struct user_regs_struct registers;
-  if (ptrace(PTRACE_GETREGS, pid, NULL, &registers)) {
-    perror("Failed to get registers at child's syscall");
-    return EXIT_FAILURE;
-  }
-  switch (registers.orig_rax) {
-  case SYS_connect:
-    {
-      struct sockaddr_in* addr = (struct sockaddr_in*) registers.rsi;
-      union in_addr_words {
-        struct in_addr in_addr;
-        uint64_t words[(sizeof(struct in_addr) + sizeof(uint64_t) - 1) / sizeof(uint64_t)];
-      } sin_addr;
-      unsigned int i;
-      for (i = 0; i < sizeof(union in_addr_words) / sizeof(uint64_t); i++) {
-        errno = 0;
-        uint64_t word = ptrace(PTRACE_PEEKDATA, pid, &addr->sin_addr + i);
-        if (errno) {
-          perror("Failed to read IP address of connect call");
-          exit(EXIT_FAILURE);
-        }
-        sin_addr.words[i] = word;
-      }
-      if ((sin_addr.in_addr.s_addr & 0xFFFFFF00) != (htonl(INADDR_LOOPBACK) & 0xFFFFFF00)) {
-        return false;
-      }
-      break;
-    }
-  }
-  return true;
 }
 
 int main(int argc, char** argv) {
@@ -182,23 +149,61 @@ int main(int argc, char** argv) {
               kids[i].next = SYSCALL_ENTER;
               break;
             case SYSCALL_BLOCKED:
-              if (ptrace(PTRACE_SETREGS, pid, NULL, &(struct user_regs_struct) { .rax = -EPERM }) == -1) {
-                perror("Failed to set error return value of blocked syscall");
-                return EXIT_FAILURE;
-              }
+	      kids[i].registers.rax = -EPERM;
+	      if (ptrace(PTRACE_SETREGS, pid, NULL, &kids[i].registers) == -1) {
+		perror("Failed to set error return value of blocked syscall");
+		return EXIT_FAILURE;
+	      }
               kids[i].next = SYSCALL_ENTER;
               break;
             case SYSCALL_ENTER:
-              if (check_syscall(pid)) {
-                kids[i].next = SYSCALL_EXIT;
-              } else {
-                if (ptrace(PTRACE_SETREGS, pid, NULL, &(struct user_regs_struct) { .orig_rax = -1 }) == -1) {
-                  perror("Failed to block syscall");
+              {
+                // Part 4: connect() restriction
+                struct user_regs_struct registers;
+                if (ptrace(PTRACE_GETREGS, pid, NULL, &registers)) {
+                  perror("Failed to get registers at child's syscall");
                   return EXIT_FAILURE;
                 }
-                kids[i].next = SYSCALL_BLOCKED;
+                kids[i].registers = registers;
+                bool allow = true;
+                switch (registers.orig_rax) {
+                case SYS_connect:
+                  {
+                    struct sockaddr_in* addr = (struct sockaddr_in*) registers.rsi;
+                    union in_addr_words {
+                      struct in_addr in_addr;
+                      uint64_t words[(sizeof(struct in_addr) + sizeof(uint64_t) - 1) / sizeof(uint64_t)];
+                    } sin_addr;
+                    unsigned int i;
+                    for (i = 0; i < sizeof(union in_addr_words) / sizeof(uint64_t); i++) {
+                      errno = 0;
+                      uint64_t word = ptrace(PTRACE_PEEKDATA, pid, &addr->sin_addr + i);
+                      if (errno) {
+                        perror("Failed to read IP address of connect call");
+			return EXIT_FAILURE;
+                      }
+                      sin_addr.words[i] = word;
+                    }
+                    if ((sin_addr.in_addr.s_addr   & 0xFFFFFF00)
+			!= (htonl(INADDR_LOOPBACK) & 0xFFFFFF00)) {
+                      allow = false;
+                      break;
+                    }
+                  }
+		  break;
+                }
+		if (allow) {
+		  kids[i].next = SYSCALL_EXIT;
+		} else {
+		  registers.orig_rax = -1;
+		  if (ptrace(PTRACE_SETREGS, pid, NULL, &registers) == -1) {
+		    perror("Failed to block syscall");
+		    return EXIT_FAILURE;
+		  }
+		  kids[i].next = SYSCALL_BLOCKED;
+		}
               }
-              break;
+	      break;
             }
             break;
           }
