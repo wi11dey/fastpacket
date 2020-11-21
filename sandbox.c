@@ -18,16 +18,49 @@
 
 static char stack[STACK_SIZE]; // Child's stack goes in bss segment
 
+/**
+ * Struct to represent a child process currently being traced.
+ */
 typedef struct {
+  /**
+   * Process ID of the child, from the perspective of the sandboxer.
+   */
   pid_t pid;
+
+  /**
+   * Enum representing what we expect from the child the next time it stops for a syscall.
+   */
   enum SyscallEvent {
+    /** 
+     * No syscall is currently in flight, so the next syscall stop must be right before a new syscall is made to the kernel.
+     */
     SYSCALL_ENTER = 0,
-    SYSCALL_EXIT = !SYSCALL_ENTER,
+
+    /**
+     * A syscall is currently being executed, so the next syscall stop must be right before the return to user mode.
+     */
+    SYSCALL_EXIT = !SYSCALL_ENTER, // Defined as the inverse of SYSCALL_ENTER, so they can be toggled with the ! operator
+
+    /**
+     * Similar to SYSCALL_EXIT, but indicates that the sandboxer blocked the syscall, so the return value should be set to -EPERM.
+     */
     SYSCALL_BLOCKED
   } next;
+
+  /**
+   * The registers captured during the last SYSCALL_ENTER, right before the kernel executes the syscall. Useful for when the syscall's return value needs to be modified.
+   */
   struct user_regs_struct registers;
 } Child;
 
+/**
+ * The function called during clone to sandbox the guest.
+ *
+ * argv's true type must be a string array (char**) of length 3:
+ *   [0]: The 0th element is ignored
+ *   [1]: The 1th element must be the directory where guest.pyc is located, which will be used as the working directory during the guest's execution
+ *   [2]: The 2nd element must be the user ID to run the guest as
+ */
 int sandbox(void* argv) {
   // argv is guaranteed to be of length 3 because the check has been done in main
   char* guest_dir = ((char**) argv)[1];
@@ -79,7 +112,6 @@ int main(int argc, char** argv) {
 
   sleep(1); // Sleep for a section to ensure that the child process has been created before we wait on it
 
-  // Part 3: fork() restrictions
   int status;
   // Wait for the firstborn to call PTRACE_TRACEME
   if (waitpid(pid, &status, 0) == -1) {
@@ -102,7 +134,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  Child kids[NUM_KIDS] = { { pid } }; // A flag for whether or not a child's syscall is running is not needed, since I wait for syscalls to finish synchronously before waiting on a different child (see below)
+  Child kids[NUM_KIDS] = { { pid } }; // The only child being watched is the firstborn; all other slots are zero-initialized by the C99 specification. The firstborn's next SyscallEvent defaults to SYSCALL_ENTER
   
   while (true) {
     // Wait for any child to change state
@@ -113,7 +145,8 @@ int main(int argc, char** argv) {
     }
 
     // Figure out what happened
-    if (WIFEXITED(status) || WIFSIGNALED(status)) { // Check whether the traced guest process has died
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+      // A child has died
       bool kids_remain = false; // This will let us know if there are no more children left
       unsigned int i;
       for (i = 0; i < sizeof(kids) / sizeof(Child); i++) {
@@ -130,33 +163,47 @@ int main(int argc, char** argv) {
         return EXIT_SUCCESS;
       }
       continue;
-    } else if (WIFSTOPPED(status)) { // Recieved a signal
+    } else if (WIFSTOPPED(status)) {
+      // A child has been stopped, due to some signal
       int signal = WSTOPSIG(status);
       if (signal == (SIGTRAP | 0x80)) { // Syscall event
+        // Part 3: fork() restrictions
+        // Check if the child that made this syscall exceeds the three-child policy
         bool too_many_kids = true;
         unsigned int i;
         for (i = 0; i < sizeof(kids) / sizeof(Child); i++) {
           if (!kids[i].pid) {
-            // There is an open spot
+            // There is an open spot for this kid
             too_many_kids = false;
-            kids[i] = (Child) { pid, SYSCALL_EXIT };
+
+            // Fill the spot with a new Child entry
+            kids[i] = (Child) { pid, SYSCALL_EXIT }; // This was the SYSCALL_ENTER, so the next SyscallEvent we are expecting from this child is the SYSCALL_EXIT
             break;
           } else if (kids[i].pid == pid) {
             // We are already watching this child
             too_many_kids = false;
-            switch (kids[i].next) {
+
+            // Figure out what to do based on what kind of SyscallEvent this is
+            switch (kids[i].next) { // The SyscallEvent that was predicted to be next will tell us what to do
             case SYSCALL_EXIT:
+              // The syscall finished and was allowed; wait for the next syscall to start
               kids[i].next = SYSCALL_ENTER;
               break;
+
             case SYSCALL_BLOCKED:
-	      kids[i].registers.rax = -EPERM;
-	      if (ptrace(PTRACE_SETREGS, pid, NULL, &kids[i].registers) == -1) {
-		perror("Failed to set error return value of blocked syscall");
-		return EXIT_FAILURE;
-	      }
+              // The syscall was blocked, so now we need to set the return value to a descriptive error
+              kids[i].registers.rax = -EPERM; // "Operation not permitted"
+              if (ptrace(PTRACE_SETREGS, pid, NULL, &kids[i].registers) == -1) {
+                perror("Failed to set error return value of blocked syscall");
+                return EXIT_FAILURE;
+              }
+
+              // Wait for the next syscall
               kids[i].next = SYSCALL_ENTER;
               break;
+
             case SYSCALL_ENTER:
+              // A syscall is about to be executed. We need to examine it to determine if it should be blocked
               {
                 // Part 4: connect() restriction
                 struct user_regs_struct registers;
@@ -164,50 +211,69 @@ int main(int argc, char** argv) {
                   perror("Failed to get registers at child's syscall");
                   return EXIT_FAILURE;
                 }
-                kids[i].registers = registers;
+
+                // Allow-by-default, unless we determine that this specific invocation needs to be blocked
                 bool allow = true;
-                switch (registers.orig_rax) {
+                switch (registers.orig_rax) { // Choose what we do based on what syscall this is
                 case SYS_connect:
                   {
+                    // The second argument (%rsi) to connect() is a pointer to the IP address, in the child process' memory
                     struct sockaddr_in* addr = (struct sockaddr_in*) registers.rsi;
+
+                    // Use a union to make reinterpreting the bytes we read from the child's memory into a struct in_addr easy
                     union in_addr_words {
                       struct in_addr in_addr;
-                      uint64_t words[(sizeof(struct in_addr) + sizeof(uint64_t) - 1) / sizeof(uint64_t)];
+                      uint64_t words[(sizeof(struct in_addr) + sizeof(uint64_t) - 1) / sizeof(uint64_t)]; // Divide the size of a struct in_addr by the size of a 64-bit word, rounding up to make sure we cover the entire struct in_addr
                     } sin_addr;
+
+                    // Fill out the union with words we read from the child process memory
                     unsigned int i;
-                    for (i = 0; i < sizeof(union in_addr_words) / sizeof(uint64_t); i++) {
+                    for (i = 0; i < sizeof(union in_addr_words) / sizeof(uint64_t); i++) { // The size of union in_addr_words will be the minimum number of words to peek in order to read a full struct in_addr, because of the arithmetic done above
                       errno = 0;
-                      uint64_t word = ptrace(PTRACE_PEEKDATA, pid, &addr->sin_addr + i);
+                      uint64_t word = ptrace(PTRACE_PEEKDATA, pid, &addr->sin_addr + i); // &addr->sin_addr will give the correct starting offset for the sin_addr field within the struct sockaddr_in located at addr
                       if (errno) {
                         perror("Failed to read IP address of connect call");
-			return EXIT_FAILURE;
+                        return EXIT_FAILURE;
                       }
                       sin_addr.words[i] = word;
                     }
+
+                    // Everything except the last octect should match the loopback address 127.0.0.1 exactly
                     if ((sin_addr.in_addr.s_addr   & 0x00FFFFFF)
-			!= (htonl(INADDR_LOOPBACK) & 0x00FFFFFF)) {
+                        != (htonl(INADDR_LOOPBACK) & 0x00FFFFFF)) {
+                      // The IP address was not of the form 127.0.0.* so it needs to be disallowed
                       allow = false;
                       break;
                     }
                   }
-		  break;
+                  break;
                 }
-		if (allow) {
-		  kids[i].next = SYSCALL_EXIT;
-		} else {
-		  registers.orig_rax = -1;
-		  if (ptrace(PTRACE_SETREGS, pid, NULL, &registers) == -1) {
-		    perror("Failed to block syscall");
-		    return EXIT_FAILURE;
-		  }
-		  kids[i].next = SYSCALL_BLOCKED;
-		}
+
+                if (allow) {
+                  // The syscall should be allowed and nothing special should be done when it exits
+                  kids[i].next = SYSCALL_EXIT;
+                } else {
+                  // The syscall should be blocked
+                  registers.orig_rax = -1; // Set the syscall number to an invalid syscall
+                  if (ptrace(PTRACE_SETREGS, pid, NULL, &registers) == -1) {
+                    perror("Failed to block syscall");
+                    return EXIT_FAILURE;
+                  }
+
+                  // When it returns, the return value should be altered to indicate that the operation was not permitted, which is the behavior of SYSCALL_BLOCKED above
+                  kids[i].next = SYSCALL_BLOCKED;
+                }
+
+                // Save the registers in the kids table so that some of them can be changed when the syscall returns, e.g. to alter the return value
+                kids[i].registers = registers;
               }
-	      break;
+              break;
             }
             break;
           }
         }
+
+        // If the entire kids table was traversed, and this is a newly observed child that we have no spot for in the table, it needs to be killed, since it exceeds the intentionally limited length of the table
         if (too_many_kids) {
           // Someone's gotta go
           if (kill(pid, SIGKILL) == -1) {
@@ -217,6 +283,7 @@ int main(int argc, char** argv) {
           continue;
         }
       } else {
+        // The child was stopped not because of a syscall, but because of some other signal, which should just be replayed
         if (ptrace(PTRACE_SYSCALL, pid, NULL, signal) == -1) {
           perror("Failed to replay child's signal");
           return EXIT_FAILURE;
@@ -225,6 +292,7 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Resume the child while watching for syscalls, unless it has been resumed in some other manner above, in which case this would have been skipped due to the continue statement
     if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == -1) {
       perror("Failed to watch for child's syscalls");
       return EXIT_FAILURE;
