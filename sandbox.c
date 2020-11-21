@@ -70,7 +70,7 @@ bool check_syscall(pid_t pid) {
   switch (registers.orig_rax) {
   case SYS_connect:
     {
-      struct sockaddr_in* addr = registers.rsi;
+      struct sockaddr_in* addr = (struct sockaddr_in*) registers.rsi;
       union in_addr_words {
         struct in_addr in_addr;
         uint64_t words[(sizeof(struct in_addr) + sizeof(uint64_t) - 1) / sizeof(uint64_t)];
