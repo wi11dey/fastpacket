@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
     }
 
     // Figure out what happened
-    if (WIFEXITED(status)) { // Check whether the traced guest process has died
+    if (WIFEXITED(status) || WIFSIGNALED(status)) { // Check whether the traced guest process has died
       bool kids_remain = false; // This will let us know if there are no more children left
       unsigned int i = 0;
       for (i = 0; i < sizeof(kids) / sizeof(Child); i++) {
@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
     }
 
     if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) == -1) {
-      perror("Failed to replay child's signal");
+      perror("Failed to watch for child's syscalls");
       return EXIT_FAILURE;
     }
   }
