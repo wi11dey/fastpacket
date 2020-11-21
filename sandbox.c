@@ -1,14 +1,17 @@
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <sched.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
-#include <stdbool.h>
+#include <netinet/ip.h>
 
 #define STACK_SIZE (1024 * 1024) // How big of a stack to give the sandboxed process (1 MiB)
 #define NUM_KIDS 3 // How many child (guest) processes to allow
@@ -37,14 +40,58 @@ int sandbox(void* argv) {
 
   // Part 2: setuid() restrictions
   // Drop to non-root uid
-  setuid(uid);
+  if (setuid(uid)) {
+    perror("Sandbox failed to drop root");
+    return EXIT_FAILURE;
+  }
 
   // Begin tracing
-  ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+  if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+    perror("Sandbox failed to request tracing");
+    return EXIT_FAILURE;
+  }
 
   // Execute guest.pyc using python3
-  execlp("python3", "python3", "guest.pyc", NULL);
+  if (execlp("python3", "python3", "guest.pyc", NULL) == -1) {
+    perror("Sandbox failed to execute guest");
+    return EXIT_FAILURE;
+  }
+
   return EXIT_SUCCESS;
+}
+
+bool check_syscall(pid_t pid) {
+  // Part 4: connect() restriction
+  struct user_regs_struct registers;
+  if (ptrace(PTRACE_GETREGS, pid, NULL, &registers)) {
+    perror("Failed to get registers at child's syscall");
+    return EXIT_FAILURE;
+  }
+  switch (registers.orig_rax) {
+  case SYS_connect:
+    {
+      struct sockaddr_in* addr = registers.rsi;
+      union in_addr_words {
+        struct in_addr in_addr;
+        uint64_t words[(sizeof(struct in_addr) + sizeof(uint64_t) - 1) / sizeof(uint64_t)];
+      } sin_addr;
+      unsigned int i;
+      for (i = 0; i < sizeof(union in_addr_words) / sizeof(uint64_t); i++) {
+        errno = 0;
+        uint64_t word = ptrace(PTRACE_PEEKDATA, pid, &addr->sin_addr + i);
+        if (errno) {
+          perror("Failed to read IP address of connect call");
+          exit(EXIT_FAILURE);
+        }
+        sin_addr.words[i] = word;
+      }
+      if ((sin_addr.in_addr.s_addr & 0xFFFFFF00) != (htonl(INADDR_LOOPBACK) & 0xFFFFFF00)) {
+        return false;
+      }
+      break;
+    }
+  }
+  return true;
 }
 
 int main(int argc, char** argv) {
@@ -101,7 +148,7 @@ int main(int argc, char** argv) {
     // Figure out what happened
     if (WIFEXITED(status) || WIFSIGNALED(status)) { // Check whether the traced guest process has died
       bool kids_remain = false; // This will let us know if there are no more children left
-      unsigned int i = 0;
+      unsigned int i;
       for (i = 0; i < sizeof(kids) / sizeof(Child); i++) {
         if (!kids[i].pid) {
           continue;
@@ -120,7 +167,7 @@ int main(int argc, char** argv) {
       int signal = WSTOPSIG(status);
       if (signal == (SIGTRAP | 0x80)) { // Syscall event
         bool too_many_kids = true;
-        unsigned int i = 0;
+        unsigned int i;
         for (i = 0; i < sizeof(kids) / sizeof(Child); i++) {
           if (!kids[i].pid) {
             // There is an open spot
@@ -131,13 +178,26 @@ int main(int argc, char** argv) {
             // We are already watching this child
             too_many_kids = false;
             switch (kids[i].next) {
-            case SYSCALL_ENTER:
             case SYSCALL_EXIT:
-              kids[i].next = !kids[i].next; // Toggle between SYSCALL_ENTER and SYSCALL_EXIT states, which are defined as inverses of each other
+              kids[i].next = SYSCALL_ENTER;
               break;
             case SYSCALL_BLOCKED:
-              ptrace(PTRACE_SETREGS, pid, NULL, &(struct user_regs_struct) { .rax = -EPERM });
+              if (ptrace(PTRACE_SETREGS, pid, NULL, &(struct user_regs_struct) { .rax = -EPERM }) == -1) {
+                perror("Failed to set error return value of blocked syscall");
+                return EXIT_FAILURE;
+              }
               kids[i].next = SYSCALL_ENTER;
+              break;
+            case SYSCALL_ENTER:
+              if (check_syscall(pid)) {
+                kids[i].next = SYSCALL_EXIT;
+              } else {
+                if (ptrace(PTRACE_SETREGS, pid, NULL, &(struct user_regs_struct) { .orig_rax = -1 }) == -1) {
+                  perror("Failed to block syscall");
+                  return EXIT_FAILURE;
+                }
+                kids[i].next = SYSCALL_BLOCKED;
+              }
               break;
             }
             break;
