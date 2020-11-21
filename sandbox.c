@@ -184,8 +184,8 @@ int main(int argc, char** argv) {
                       }
                       sin_addr.words[i] = word;
                     }
-                    if ((sin_addr.in_addr.s_addr   & 0xFFFFFF00)
-			!= (htonl(INADDR_LOOPBACK) & 0xFFFFFF00)) {
+                    if ((sin_addr.in_addr.s_addr   & 0x00FFFFFF)
+			!= (htonl(INADDR_LOOPBACK) & 0x00FFFFFF)) {
                       allow = false;
                       break;
                     }
